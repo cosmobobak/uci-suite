@@ -1,10 +1,11 @@
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 //! An EPD test suite runner for UCI chess engines.
 
 use anyhow::Context;
 use shakmaty::{fen::Fen, san::San, Chess};
 use std::{
     io::{BufRead, BufReader, Write},
-    sync::atomic::AtomicUsize,
+    sync::atomic::AtomicUsize, str::FromStr,
 };
 
 use clap::Parser;
@@ -14,12 +15,36 @@ const CONTROL_GREEN: &str = "\u{001b}[32m";
 const CONTROL_RED: &str = "\u{001b}[31m";
 const CONTROL_RESET: &str = "\u{001b}[0m";
 
+#[derive(Debug, Copy, Clone)]
+pub enum InbuiltEpd {
+    WinAtChess,
+    Zugzwangs,
+    Tablebases,
+}
+
+impl FromStr for InbuiltEpd {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "winatchess" | "wac" => Ok(Self::WinAtChess),
+            "zugzwangs" | "zugts" => Ok(Self::Zugzwangs),
+            "tablebases" | "tbs" => Ok(Self::Tablebases),
+            _ => Err(anyhow::anyhow!("Invalid inbuilt EPD: {}", s)),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[clap(author, version, about)]
 #[allow(clippy::struct_excessive_bools, clippy::option_option)]
 pub struct Cli {
     /// Path to a UCI chess engine to run on the test suite.
     pub engine: std::path::PathBuf,
+    /// Selection of inbuilt EPD test suites to run.
+    /// Valid values are `winatchess`, `zugzwangs`, and `tablebases`.
+    #[clap(long, value_name = "NAME")]
+    pub inbuilt: Option<InbuiltEpd>,
     /// Path to an Extended Position Description file to use.
     #[clap(long, value_name = "PATH")]
     pub epdpath: Option<std::path::PathBuf>,
@@ -29,6 +54,9 @@ pub struct Cli {
     /// Run the test suite in verbose mode.
     #[clap(short, long)]
     pub verbose: bool,
+    /// Run the test suite in debug mode.
+    #[clap(long)]
+    pub debug: bool,
     /// Time the engine should spend on each position, in milliseconds.
     #[clap(long, value_name = "MILLISECONDS")]
     pub time: Option<u64>,
@@ -104,7 +132,7 @@ fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
     // Read the EPD file into a string.
-    let epd_text = cli.epdpath.map_or(WIN_AT_CHESS, |path| {
+    let epd_text = cli.epdpath.as_deref().map_or(WIN_AT_CHESS, |path| {
         std::fs::read_to_string(path)
             .expect("Failed to read EPD file")
             .leak()
@@ -116,72 +144,26 @@ fn main() -> Result<(), anyhow::Error> {
         .map(parse_epd)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut engine_process = std::process::Command::new(&cli.engine)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn engine process");
-
-    // Take the engine's stdin and stdout.
-    let mut engine_stdin = engine_process.stdin.take().with_context(|| {
-        format!(
-            "Failed to take stdin of engine process {}",
-            cli.engine.display()
-        )
-    })?;
-    let mut engine_stdout = BufReader::new(engine_process.stdout.take().with_context(|| {
-        format!(
-            "Failed to take stdout of engine process {}",
-            cli.engine.display()
-        )
-    })?);
+    let (mut engine_stdin, mut engine_stdout) = boot_engine(&cli)?;
 
     // send the engine the UCI protocol commands to initialize it
-    engine_stdin.write_all(b"uci\n").with_context(|| {
-        format!(
-            "Failed to write to stdin of engine process {}",
-            cli.engine.display()
-        )
-    })?;
-    engine_stdin.write_all(b"isready\n").with_context(|| {
-        format!(
-            "Failed to write to stdin of engine process {}",
-            cli.engine.display()
-        )
-    })?;
+    write_line(cli.debug, &mut engine_stdin, "uci\n")?;
+    write_line(cli.debug, &mut engine_stdin, "isready\n")?;
     // wait for the engine to respond
-    let mut engine_response = String::new();
     loop {
-        engine_stdout
-            .read_line(&mut engine_response)
-            .with_context(|| {
-                format!(
-                    "Failed to read from stdout of engine process {}",
-                    cli.engine.display()
-                )
-            })?;
+        let engine_response = read_line(cli.debug, &mut engine_stdout)?;
         if engine_response.contains("readyok") {
             break;
         }
-        if cli.verbose {
-            println!("[#] {}", engine_response.trim());
-        }
-        engine_response.clear();
     }
 
     // send the engine the UCI options to set
     for option in cli.option {
         let (name, value) = option
             .split_once('=')
-            .with_context(|| format!("Invalid option: {}", option))?;
-        engine_stdin
-            .write_all(format!("setoption name {} value {}\n", name, value).as_bytes())
-            .with_context(|| {
-                format!(
-                    "Failed to write to stdin of engine process {}",
-                    cli.engine.display()
-                )
-            })?;
+            .with_context(|| format!("Invalid option: {option}"))?;
+        let set_option_text = format!("setoption name {name} value {value}\n");
+        write_line(cli.debug, &mut engine_stdin, &set_option_text)?;
     }
 
     // start the testing loop -
@@ -193,98 +175,49 @@ fn main() -> Result<(), anyhow::Error> {
     let maxidlen = positions.iter().map(|pos| pos.id.len()).max().unwrap();
     let n = positions.len();
     let start_time = std::time::Instant::now();
-    for EpdPosition {
-        fen,
-        best_moves,
-        id,
-    } in positions
-    {
+    for epd in positions {
         // send `ucinewgame` to the engine to reset its internal state
-        engine_stdin.write_all(b"ucinewgame\n").with_context(|| {
-            format!(
-                "Failed to write to stdin of engine process {}",
-                cli.engine.display()
-            )
-        })?;
+        write_line(cli.debug, &mut engine_stdin, "ucinewgame\n")?;
         // send the position to the engine
-        engine_stdin
-            .write_all(format!("position fen {}\n", fen).as_bytes())
-            .with_context(|| {
-                format!(
-                    "Failed to write to stdin of engine process {}",
-                    cli.engine.display()
-                )
-            })?;
+        write_line(cli.debug, &mut engine_stdin, &format!("position fen {}\n", epd.fen))?;
         // send the `go` command to the engine to make it think about the position
-        engine_stdin
-            .write_all(format!("go movetime {}\n", time).as_bytes())
-            .with_context(|| {
-                format!(
-                    "Failed to write to stdin of engine process {}",
-                    cli.engine.display()
-                )
-            })?;
+        write_line(cli.debug, &mut engine_stdin, &format!("go movetime {time}\n"))?;
         let think_start = std::time::Instant::now();
         // wait for the engine to respond with `bestmove <move>`
-        let mut engine_response = String::new();
+        let mut engine_response;
         loop {
-            engine_stdout
-                .read_line(&mut engine_response)
-                .with_context(|| {
-                    format!(
-                        "Failed to read from stdout of engine process {}",
-                        cli.engine.display()
-                    )
-                })?;
+            engine_response = read_line(cli.debug, &mut engine_stdout)?;
             if cli.verbose {
                 println!(
                     "[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {}",
                     engine_response.trim(),
-                    midl = maxidlen
+                    midl = maxidlen,
+                    id = epd.id,
                 );
             }
             if engine_response.contains("bestmove") {
                 break;
             }
-            engine_response.clear();
         }
         // parse the engine's best move
         let engine_best_move = engine_response
             .split_whitespace()
             .nth(1)
-            .with_context(|| format!("Failed to parse engine response: {}", engine_response))?;
+            .with_context(|| format!("Failed to parse engine response: {engine_response}"))?;
         let think_time = think_start.elapsed();
         // check if the engine's best move matches any of the EPD's best moves
-        let passed = best_moves
+        let passed = epd
+            .best_moves
             .iter()
             .any(|best_move| best_move == engine_best_move);
         // print the result
-        let colour = if passed { CONTROL_GREEN } else { CONTROL_RED };
-        let failinfo = if passed {
-            format!(
-                " {CONTROL_GREY}{:.1}s{CONTROL_RESET}",
-                think_time.as_secs_f64()
-            )
-        } else {
-            format!(" {CONTROL_GREY}{:.1}s{CONTROL_RESET} program chose {CONTROL_RED}{engine_best_move}{CONTROL_RESET}", think_time.as_secs_f64())
-        };
-        let move_fmt = |m: &String| {
-            if m == engine_best_move {
-                m.clone()
-            } else {
-                format!("{CONTROL_GREY}{m}{CONTROL_RESET}")
-            }
-        };
-        let move_strings = best_moves
-            .iter()
-            .map(move_fmt)
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!(
-            "[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {fen:mfl$} {colour}{}{CONTROL_RESET} [{move_strings}]{failinfo}",
-            if passed { "PASS" } else { "FAIL" },
-            midl = maxidlen,
-            mfl = maxfenlen,
+        print_position_results(
+            &epd,
+            passed,
+            think_time,
+            engine_best_move,
+            maxidlen,
+            maxfenlen,
         );
         if passed {
             successes += 1;
@@ -298,5 +231,95 @@ fn main() -> Result<(), anyhow::Error> {
     );
     println!("{successes}/{n} passed");
 
+    Ok(())
+}
+
+fn print_position_results(
+    epd: &EpdPosition,
+    passed: bool,
+    think_time: std::time::Duration,
+    engine_best_move: &str,
+    maxidlen: usize,
+    maxfenlen: usize,
+) {
+    let colour = if passed { CONTROL_GREEN } else { CONTROL_RED };
+    let failinfo = if passed {
+        format!(
+            " {CONTROL_GREY}{:.1}s{CONTROL_RESET}",
+            think_time.as_secs_f64()
+        )
+    } else {
+        format!(" {CONTROL_GREY}{:.1}s{CONTROL_RESET} program chose {CONTROL_RED}{engine_best_move}{CONTROL_RESET}", think_time.as_secs_f64())
+    };
+    let move_fmt = |m: &String| {
+        if m == engine_best_move {
+            m.clone()
+        } else {
+            format!("{CONTROL_GREY}{m}{CONTROL_RESET}")
+        }
+    };
+    let move_strings = epd
+        .best_moves
+        .iter()
+        .map(move_fmt)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {fen:mfl$} {colour}{}{CONTROL_RESET} [{move_strings}]{failinfo}",
+        if passed { "PASS" } else { "FAIL" },
+        midl = maxidlen,
+        mfl = maxfenlen,
+        id = epd.id,
+        fen = epd.fen,
+    );
+}
+
+fn boot_engine(
+    cli: &Cli,
+) -> Result<
+    (
+        std::process::ChildStdin,
+        BufReader<std::process::ChildStdout>,
+    ),
+    anyhow::Error,
+> {
+    let mut engine_process = std::process::Command::new(&cli.engine)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn engine process");
+    let engine_stdin = engine_process.stdin.take().with_context(|| {
+        format!(
+            "Failed to take stdin of engine process {}",
+            cli.engine.display()
+        )
+    })?;
+    let engine_stdout = BufReader::new(engine_process.stdout.take().with_context(|| {
+        format!(
+            "Failed to take stdout of engine process {}",
+            cli.engine.display()
+        )
+    })?);
+    Ok((engine_stdin, engine_stdout))
+}
+
+fn read_line(debug: bool, reader: &mut BufReader<std::process::ChildStdout>) -> Result<String, anyhow::Error> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .with_context(|| "Failed to read from engine process")?;
+    if debug {
+        eprintln!("[?] ENGINE -> TOOL: {}", line.trim());
+    }
+    Ok(line)
+}
+
+fn write_line(debug: bool, writer: &mut std::process::ChildStdin, line: &str) -> Result<(), anyhow::Error> {
+    writer
+        .write_all(line.as_bytes())
+        .with_context(|| "Failed to write to engine process")?;
+    if debug {
+        eprintln!("[?] TOOL -> ENGINE: {}", line.trim());
+    }
     Ok(())
 }
