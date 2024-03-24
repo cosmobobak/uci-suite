@@ -6,7 +6,7 @@ use shakmaty::{
     fen::Fen,
     san::{San, SanPlus},
     uci::Uci,
-    Chess, Position,
+    Chess,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -72,8 +72,8 @@ pub struct Cli {
 }
 
 const WIN_AT_CHESS: &str = include_str!("../epds/wac.epd");
-const _ZUGZWANGS: &str = include_str!("../epds/zugts.epd");
-const _TABLEBASES: &str = include_str!("../epds/tbtest.epd");
+const ZUGZWANGS: &str = include_str!("../epds/zugts.epd");
+const TABLEBASES: &str = include_str!("../epds/tbtest.epd");
 
 struct EpdPosition {
     fen: String,
@@ -117,11 +117,18 @@ fn parse_epd(line: &str) -> Result<EpdPosition, anyhow::Error> {
 fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
+    // Get the default EPD file to use.
+    let epd_text = match cli.inbuilt {
+        Some(InbuiltEpd::Zugzwangs) => ZUGZWANGS,
+        Some(InbuiltEpd::Tablebases) => TABLEBASES,
+        None | Some(InbuiltEpd::WinAtChess) => WIN_AT_CHESS,
+    };
+
     // Read the EPD file into a string.
     let epd_text = cli
         .epdpath
         .as_deref()
-        .map_or(WIN_AT_CHESS, |path| std::fs::read_to_string(path).expect("Failed to read EPD file").leak());
+        .map_or(epd_text, |path| std::fs::read_to_string(path).expect("Failed to read EPD file").leak());
 
     // Parse the EPD file into a vector of positions.
     let positions = epd_text.lines().map(parse_epd).collect::<Result<Vec<_>, _>>()?;
