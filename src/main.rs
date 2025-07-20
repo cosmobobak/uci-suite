@@ -106,7 +106,7 @@ fn parse_epd(line: &str) -> Result<EpdPosition, anyhow::Error> {
         .collect::<Result<_, _>>()?;
     let id_idx = line.find("id");
     let id = if let Some(id_idx) = id_idx {
-        line[id_idx + 4..].split(|c| c == '"').next().with_context(|| format!("no id found in {line}"))?.to_string()
+        line[id_idx + 4..].split('"').next().with_context(|| format!("no id found in {line}"))?.to_string()
     } else {
         format!("position {counter}")
     };
@@ -162,6 +162,7 @@ fn main() -> Result<(), anyhow::Error> {
     let maxidlen = positions.iter().map(|pos| pos.id.len()).max().unwrap();
     let n = positions.len();
     let start_time = std::time::Instant::now();
+    let mut fail_messages = Vec::new();
     for epd in positions {
         // send `ucinewgame` to the engine to reset its internal state
         write_line(cli.debug, &mut engine_stdin, "ucinewgame\n")?;
@@ -211,26 +212,35 @@ fn main() -> Result<(), anyhow::Error> {
         // check if the engine's best move matches any of the EPD's best moves
         let passed = epd.best_moves.iter().any(|best_move| best_move == engine_best_move);
         // print the result
-        print_position_results(&epd, passed, think_time, engine_best_move, maxidlen, maxfenlen);
+        let s = format_position_results(&epd, passed, think_time, engine_best_move, maxidlen, maxfenlen);
+        println!("{s}");
         if passed {
             successes += 1;
+        } else {
+            fail_messages.push(s);
         }
     }
     let elapsed = start_time.elapsed();
     println!("{n} positions in {}.{:03}s", elapsed.as_secs(), elapsed.subsec_millis());
     println!("{successes}/{n} passed");
+    if !fail_messages.is_empty() {
+        println!("{CONTROL_RED}FAILURES{CONTROL_RESET}:");
+        for fail_message in fail_messages {
+            println!("{fail_message}");
+        }
+    }
 
     Ok(())
 }
 
-fn print_position_results(
+fn format_position_results(
     epd: &EpdPosition,
     passed: bool,
     think_time: std::time::Duration,
     engine_best_move: &str,
     maxidlen: usize,
     maxfenlen: usize,
-) {
+) -> String {
     let position = Fen::from_str(&epd.fen).unwrap().into_position::<Chess>(shakmaty::CastlingMode::Standard).unwrap();
     let best_move_sans = epd
         .best_moves
@@ -262,14 +272,14 @@ fn print_position_results(
         }
     };
     let move_strings = best_move_sans.iter().map(move_fmt).collect::<Vec<_>>().join(", ");
-    println!(
+    format!(
         "[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {fen:mfl$} {colour}{}{CONTROL_RESET} [{move_strings}]{failinfo}",
         if passed { "PASS" } else { "FAIL" },
         midl = maxidlen,
         mfl = maxfenlen,
         id = epd.id,
         fen = epd.fen,
-    );
+    )
 }
 
 fn boot_engine(cli: &Cli) -> Result<(std::process::ChildStdin, BufReader<std::process::ChildStdout>), anyhow::Error> {
