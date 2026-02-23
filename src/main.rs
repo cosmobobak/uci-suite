@@ -133,7 +133,7 @@ fn main() -> Result<(), anyhow::Error> {
     // Parse the EPD file into a vector of positions.
     let positions = epd_text.lines().map(parse_epd).collect::<Result<Vec<_>, _>>()?;
 
-    let (mut engine_stdin, mut engine_stdout) = boot_engine(&cli)?;
+    let (mut engine_process, mut engine_stdin, mut engine_stdout) = boot_engine(&cli)?;
 
     // send the engine the UCI protocol commands to initialize it
     write_line(cli.debug, &mut engine_stdin, "uci\n")?;
@@ -173,10 +173,25 @@ fn main() -> Result<(), anyhow::Error> {
         let think_start = std::time::Instant::now();
         // wait for the engine to respond with `bestmove <move>`
         let engine_response;
+        let mut stdout = std::io::stdout();
         loop {
             let line = read_line(cli.debug, &mut engine_stdout)?;
             if cli.verbose {
-                println!("[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {}", line.trim(), midl = maxidlen, id = epd.id,);
+                let score = line.split_once("score ").and_then(|(_, after)| {
+                    let tail = after.split_at(after.match_indices(' ').map(|(i, _)| i).nth(1)?).0.trim();
+                    Some(tail)
+                });
+                let line = match score.zip(line.split_once("pv ")) {
+                    Some((score, (_, pv))) => format!("score {score} pv {pv}"),
+                    None => line.trim().to_string(),
+                };
+                let log = format!("\r[{CONTROL_GREY}{id:midl$}{CONTROL_RESET}] {}", line, midl = maxidlen, id = epd.id);
+                let log = log.as_bytes();
+                let log = &log[..log.len().min(120)];
+                let last_space = log.iter().rposition(|b| *b == b' ');
+                let log = &log[..last_space.unwrap_or(log.len())];
+                stdout.write_all(log).unwrap();
+                stdout.flush().unwrap();
             }
             if line.contains("bestmove") {
                 engine_response = line;
@@ -213,7 +228,7 @@ fn main() -> Result<(), anyhow::Error> {
         let passed = epd.best_moves.iter().any(|best_move| best_move == engine_best_move);
         // print the result
         let s = format_position_results(&epd, passed, think_time, engine_best_move, maxidlen, maxfenlen);
-        println!("{s}");
+        println!("\r{s: <160}");
         if passed {
             successes += 1;
         } else {
@@ -229,6 +244,9 @@ fn main() -> Result<(), anyhow::Error> {
             println!("{fail_message}");
         }
     }
+
+    write_line(cli.debug, &mut engine_stdin, "quit\n")?;
+    engine_process.wait().unwrap();
 
     Ok(())
 }
@@ -282,23 +300,26 @@ fn format_position_results(
     )
 }
 
-fn boot_engine(cli: &Cli) -> Result<(std::process::ChildStdin, BufReader<std::process::ChildStdout>), anyhow::Error> {
+fn boot_engine(
+    cli: &Cli,
+) -> Result<(std::process::Child, std::process::ChildStdin, BufReader<std::process::ChildStdout>), anyhow::Error> {
     let mut engine_process = std::process::Command::new(&cli.engine)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("Failed to spawn engine process");
-    let engine_stdin = engine_process
-        .stdin
-        .take()
-        .with_context(|| format!("Failed to take stdin of engine process {}", cli.engine.display()))?;
-    let engine_stdout = BufReader::new(
-        engine_process
-            .stdout
-            .take()
-            .with_context(|| format!("Failed to take stdout of engine process {}", cli.engine.display()))?,
-    );
-    Ok((engine_stdin, engine_stdout))
+    let Some(engine_stdin) = engine_process.stdin.take() else {
+        let _ = engine_process.kill();
+        let _ = engine_process.wait();
+        anyhow::bail!("Failed to take stdin of engine process {}", cli.engine.display());
+    };
+    let Some(engine_stdout) = engine_process.stdout.take() else {
+        let _ = engine_process.kill();
+        let _ = engine_process.wait();
+        anyhow::bail!("Failed to take stdout of engine process {}", cli.engine.display());
+    };
+    let engine_stdout = BufReader::new(engine_stdout);
+    Ok((engine_process, engine_stdin, engine_stdout))
 }
 
 fn read_line(debug: bool, reader: &mut BufReader<std::process::ChildStdout>) -> Result<String, anyhow::Error> {
